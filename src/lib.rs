@@ -170,7 +170,7 @@ impl Tokenizer {
     /// Core incremental BPE training given unique words and their counts.
     /// `words`: one entry per unique chunk (Vec<u32> of token-ids/bytes).
     /// `counts`: same length as `words`, count per chunk.
-    fn train_core_incremental(&mut self, mut words: Vec<Word>, counts: Vec<i32>, vocab_size: u32) {
+    fn train_core_incremental(&mut self, mut words: Vec<Word>, counts: Vec<i32>, vocab_size: u32, min_frequency: i32) {
         assert!(vocab_size >= 256, "vocab_size must be at least 256");
         let num_merges = vocab_size - 256;
         log::info!("Starting BPE training: {} merges to compute", num_merges);
@@ -188,7 +188,7 @@ impl Tokenizer {
         let mut heap = OctonaryHeap::with_capacity(pair_counts.len());
         for (pair, pos) in where_to_update.drain() {
             let c = *pair_counts.get(&pair).unwrap_or(&0);
-            if c > 0 {
+            if c >= min_frequency {
                 heap.push(MergeJob {
                     pair,
                     count: c as u64,
@@ -243,7 +243,7 @@ impl Tokenizer {
             // Add the updated pair counts back to the heap
             for (pair, pos) in local_pos_updates {
                 let cnt = *pair_counts.get(&pair).unwrap_or(&0);
-                if cnt > 0 {
+                if cnt >= min_frequency {
                     heap.push(MergeJob {
                         pair,
                         count: cnt as u64,
@@ -290,8 +290,8 @@ impl Tokenizer {
     /// Train from a streaming iterator (parallel ingestion).
     /// We refill a Rust Vec<String> buffer under the GIL, then release the GIL
     /// to do the heavy splitting and counting **in parallel** with rayon.
-    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None))]
-    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None)")]
+    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, min_frequency=2))]
+    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, min_frequency=2)")]
     pub fn train_from_iterator(
         &mut self,
         py: pyo3::Python<'_>,
@@ -299,6 +299,7 @@ impl Tokenizer {
         vocab_size: u32,
         buffer_size: usize,
         pattern: Option<String>,
+        min_frequency: i32,
     ) -> PyResult<()> {
         // Use provided pattern or default to GPT-4 pattern
         let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
@@ -410,7 +411,7 @@ impl Tokenizer {
             cvec.push(c);
         }
 
-        self.train_core_incremental(words, cvec, vocab_size);
+        self.train_core_incremental(words, cvec, vocab_size, min_frequency);
         Ok(())
     }
 
@@ -749,7 +750,7 @@ mod tests {
         let counts = vec![10, 5];
 
         // Train with vocab_size = 257 (one merge)
-        tok.train_core_incremental(words, counts, 257);
+        tok.train_core_incremental(words, counts, 257, 1);
 
         // Should have merged (97, 98) since it has higher count
         assert_eq!(tok.merges.len(), 1);
@@ -940,7 +941,7 @@ mod tests {
 
         // Train with vocab_size = 258 (2 merges)
         // But we only have one unique pair, so only one merge will happen
-        tok.train_core_incremental(words, counts, 258);
+        tok.train_core_incremental(words, counts, 258, 1);
 
         assert_eq!(tok.merges.len(), 1);
     }
@@ -959,7 +960,7 @@ mod tests {
         let words = vec![Word::new(vec![97, 97, 97])];
         let counts = vec![10];
 
-        tok.train_core_incremental(words, counts, 258);
+        tok.train_core_incremental(words, counts, 258, 1);
 
         assert_eq!(tok.merges.len(), 2);
         assert_eq!(tok.merges.get(&(97, 97)), Some(&256));
