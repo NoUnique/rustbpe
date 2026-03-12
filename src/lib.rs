@@ -511,6 +511,19 @@ impl Tokenizer {
         mergeable_ranks
     }
 
+    /// Return the merge pairs as (left_id, right_id, merged_id) sorted by merged_id.
+    /// This provides the ground-truth merge order from training, avoiding
+    /// the need to reconstruct merges from mergeable_ranks.
+    pub fn get_merges(&self) -> Vec<(u32, u32, u32)> {
+        let mut result: Vec<(u32, u32, u32)> = self
+            .merges
+            .iter()
+            .map(|(&(left, right), &merged_id)| (left, right, merged_id))
+            .collect();
+        result.sort_by_key(|&(_, _, merged_id)| merged_id);
+        result
+    }
+
     /// Encode a string into token IDs
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut all_ids = Vec::new();
