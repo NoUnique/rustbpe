@@ -14,6 +14,47 @@ const GPT4_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{
 
 type Pair = (u32, u32);
 
+// HF-compatible byte-to-ID mapping (GPT-2 byte encoding sorted by Unicode codepoint)
+// Maps raw byte value -> HF token ID
+const BYTE_TO_HF_ID: [u32; 256] = [
+    188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+    204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+    220,   0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,
+     15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,  28,  29,  30,
+     31,  32,  33,  34,  35,  36,  37,  38,  39,  40,  41,  42,  43,  44,  45,  46,
+     47,  48,  49,  50,  51,  52,  53,  54,  55,  56,  57,  58,  59,  60,  61,  62,
+     63,  64,  65,  66,  67,  68,  69,  70,  71,  72,  73,  74,  75,  76,  77,  78,
+     79,  80,  81,  82,  83,  84,  85,  86,  87,  88,  89,  90,  91,  92,  93, 221,
+    222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+    238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+    254,  94,  95,  96,  97,  98,  99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+    108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+    124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+    140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+    156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+    172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+];
+
+// Reverse mapping: HF token ID -> raw byte value
+const HF_ID_TO_BYTE: [u8; 256] = [
+     33,  34,  35,  36,  37,  38,  39,  40,  41,  42,  43,  44,  45,  46,  47,  48,
+     49,  50,  51,  52,  53,  54,  55,  56,  57,  58,  59,  60,  61,  62,  63,  64,
+     65,  66,  67,  68,  69,  70,  71,  72,  73,  74,  75,  76,  77,  78,  79,  80,
+     81,  82,  83,  84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,
+     97,  98,  99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
+    113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 161, 162,
+    163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 174, 175, 176, 177, 178, 179,
+    180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195,
+    196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211,
+    212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227,
+    228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243,
+    244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255,   0,   1,   2,   3,
+      4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,  15,  16,  17,  18,  19,
+     20,  21,  22,  23,  24,  25,  26,  27,  28,  29,  30,  31,  32, 127, 128, 129,
+    130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145,
+    146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 173,
+];
+
 /// A Byte Pair Encoding tokenizer that matches the GPT-4 style implementation
 #[pyclass]
 pub struct Tokenizer {
@@ -23,11 +64,13 @@ pub struct Tokenizer {
     pub pattern: String,
     /// Compiled regex for efficiency
     compiled_pattern: Regex,
+    /// Use HF-compatible byte-to-ID mapping for tie-breaking equivalence
+    use_hf_byte_order: bool,
 }
 
 impl Default for Tokenizer {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -279,11 +322,13 @@ impl Tokenizer {
 impl Tokenizer {
     /// Create a new Tokenizer
     #[new]
-    pub fn new() -> Self {
+    #[pyo3(signature = (use_hf_byte_order=false))]
+    pub fn new(use_hf_byte_order: bool) -> Self {
         Self {
             merges: StdHashMap::new(),
             pattern: String::new(),
             compiled_pattern: Regex::new("").expect("Empty regex should be valid"),
+            use_hf_byte_order,
         }
     }
 
@@ -402,11 +447,14 @@ impl Tokenizer {
         );
 
         // Materialize words & counts
+        let use_hf = self.use_hf_byte_order;
         let mut words = Vec::with_capacity(counts.len());
         let mut cvec = Vec::with_capacity(counts.len());
         for (chunk, c) in counts.into_iter() {
             words.push(Word::new(
-                chunk.as_bytes().iter().map(|&b| b as u32).collect(),
+                chunk.as_bytes().iter().map(|&b| {
+                    if use_hf { BYTE_TO_HF_ID[b as usize] } else { b as u32 }
+                }).collect(),
             ));
             cvec.push(c);
         }
@@ -431,7 +479,13 @@ impl Tokenizer {
         let mut mergeable_ranks = Vec::new();
 
         // Build vocabulary incrementally from low to high token IDs
-        let mut token_bytes: Vec<Vec<u8>> = (0..256_u32).map(|i| vec![i as u8]).collect();
+        let mut token_bytes: Vec<Vec<u8>> = (0..256_u32).map(|i| {
+            if self.use_hf_byte_order {
+                vec![HF_ID_TO_BYTE[i as usize]]
+            } else {
+                vec![i as u8]
+            }
+        }).collect();
 
         for (i, bytes) in token_bytes.iter().enumerate() {
             mergeable_ranks.push((bytes.clone(), i as u32));
@@ -473,7 +527,9 @@ impl Tokenizer {
             };
 
             // Convert chunk to bytes then to u32 IDs
-            let mut ids: Vec<u32> = chunk.bytes().map(|b| b as u32).collect();
+            let mut ids: Vec<u32> = chunk.bytes().map(|b| {
+                if self.use_hf_byte_order { BYTE_TO_HF_ID[b as usize] } else { b as u32 }
+            }).collect();
 
             // Apply merges iteratively (always merge the earliest-learned pair first)
             while ids.len() >= 2 {
@@ -508,7 +564,13 @@ impl Tokenizer {
     /// Decode token IDs back to a string
     pub fn decode(&self, ids: Vec<u32>) -> PyResult<String> {
         // Build reverse mapping: token_id -> bytes
-        let mut vocab: Vec<Vec<u8>> = (0..256u32).map(|i| vec![i as u8]).collect();
+        let mut vocab: Vec<Vec<u8>> = (0..256u32).map(|i| {
+            if self.use_hf_byte_order {
+                vec![HF_ID_TO_BYTE[i as usize]]
+            } else {
+                vec![i as u8]
+            }
+        }).collect();
 
         // Sort merges by token id to reconstruct bytes in order
         let mut sorted_merges: Vec<_> = self.merges.iter().collect();
@@ -635,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_tokenizer_new() {
-        let tok = Tokenizer::new();
+        let tok = Tokenizer::new(false);
         assert!(tok.merges.is_empty());
         assert!(tok.pattern.is_empty());
     }
@@ -643,7 +705,7 @@ mod tests {
     #[test]
     fn test_encode_untrained_simple() {
         // With no merges and empty pattern, encode returns nothing (no regex matches)
-        let tok = Tokenizer::new();
+        let tok = Tokenizer::new(false);
         let ids = tok.encode("hello");
         assert!(ids.is_empty()); // empty pattern matches nothing
     }
@@ -655,6 +717,7 @@ mod tests {
             merges: StdHashMap::new(),
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
+            use_hf_byte_order: false,
         };
         let ids = tok.encode("hi");
         // 'h' = 104, 'i' = 105
@@ -671,6 +734,7 @@ mod tests {
             merges,
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
+            use_hf_byte_order: false,
         };
 
         let ids = tok.encode("hi");
@@ -683,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_get_mergeable_ranks_empty() {
-        let tok = Tokenizer::new();
+        let tok = Tokenizer::new(false);
         let ranks = tok.get_mergeable_ranks();
         // Should have 256 byte-level tokens
         assert_eq!(ranks.len(), 256);
@@ -703,6 +767,7 @@ mod tests {
             merges,
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
+            use_hf_byte_order: false,
         };
 
         let ranks = tok.get_mergeable_ranks();
@@ -740,6 +805,7 @@ mod tests {
             merges: StdHashMap::new(),
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
+            use_hf_byte_order: false,
         };
 
         // "ab" repeated 10 times, "cd" repeated 5 times
@@ -769,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_vocab_size() {
-        let mut tok = Tokenizer::new();
+        let mut tok = Tokenizer::new(false);
         assert_eq!(tok.vocab_size(), 256);
 
         // Add some merges manually
@@ -827,6 +893,7 @@ mod tests {
             merges,
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
+            use_hf_byte_order: false,
         };
 
         // "aaa" should encode as [257]
@@ -871,6 +938,7 @@ mod tests {
             merges,
             pattern: r"\w+|\s+".to_string(),
             compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
+            use_hf_byte_order: false,
         };
 
         let text = "hi";
@@ -890,6 +958,7 @@ mod tests {
             merges,
             pattern: r"\w+|\s+".to_string(),
             compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
+            use_hf_byte_order: false,
         };
 
         let text = "hello world";
@@ -905,6 +974,7 @@ mod tests {
             merges: StdHashMap::new(),
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
+            use_hf_byte_order: false,
         };
 
         // [104, 105] = "hi"
@@ -914,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_decode_invalid_token() {
-        let tok = Tokenizer::new();
+        let tok = Tokenizer::new(false);
 
         // Token 300 doesn't exist (only 0-255 in base vocab)
         let result = tok.decode(vec![300]);
@@ -927,6 +997,7 @@ mod tests {
             merges: StdHashMap::new(),
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
+            use_hf_byte_order: false,
         };
 
         // "ab" appears 100 times, "bc" appears 50 times
@@ -952,6 +1023,7 @@ mod tests {
             merges: StdHashMap::new(),
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
+            use_hf_byte_order: false,
         };
 
         // "aaa" = [97, 97, 97]
@@ -978,6 +1050,7 @@ mod tests {
             merges,
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
+            use_hf_byte_order: false,
         };
 
         let ranks = tok.get_mergeable_ranks();
@@ -996,6 +1069,7 @@ mod tests {
             merges: StdHashMap::new(),
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
+            use_hf_byte_order: false,
         };
 
         let ids = tok.encode("");
@@ -1009,6 +1083,7 @@ mod tests {
             merges: StdHashMap::new(),
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
+            use_hf_byte_order: false,
         };
 
         let ids = tok.encode("   "); // only spaces
@@ -1017,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_decode_empty() {
-        let tok = Tokenizer::new();
+        let tok = Tokenizer::new(false);
         let decoded = tok.decode(vec![]).unwrap();
         assert_eq!(decoded, "");
     }
