@@ -210,6 +210,24 @@ fn count_pairs_parallel(
         )
 }
 
+/// Apply all existing merges to a single word (greedy encoding: always pick the merge with the
+/// lowest merged_id first). This is equivalent to BPE-encoding the word with the given merges.
+/// Used to fast-forward corpus state when resuming training from existing merges.
+fn apply_merges_to_word(word: &mut Word, merges: &StdHashMap<Pair, u32>) {
+    loop {
+        let best = word
+            .pairs()
+            .filter_map(|pair| merges.get(&pair).map(|&id| (pair, id)))
+            .min_by_key(|&(_, id)| id);
+        match best {
+            None => break,
+            Some((pair, new_id)) => {
+                word.merge_pair(pair, new_id);
+            }
+        }
+    }
+}
+
 // ------------------------ END helpers ------------------------
 
 impl Tokenizer {
@@ -218,9 +236,40 @@ impl Tokenizer {
     /// `counts`: same length as `words`, count per chunk.
     fn train_core_incremental(&mut self, mut words: Vec<Word>, counts: Vec<i32>, vocab_size: u32, min_frequency: i32) {
         assert!(vocab_size >= 256, "vocab_size must be at least 256");
-        let num_merges = vocab_size - 256;
-        log::info!("Starting BPE training: {} merges to compute", num_merges);
-        self.merges.clear();
+
+        // Resume support: check how many merges already exist
+        let start_merges_done = self.merges.len() as u32;
+        let total_merges_needed = vocab_size.saturating_sub(256);
+
+        if start_merges_done == 0 {
+            // Fresh training: clear merges (guards against dirty state)
+            self.merges.clear();
+        } else {
+            // Resume mode: apply all existing merges to the corpus in parallel
+            // so the words reflect the current vocabulary state.
+            if start_merges_done >= total_merges_needed {
+                log::info!(
+                    "Already have {} merges (target {}). No additional training needed.",
+                    start_merges_done, total_merges_needed
+                );
+                return;
+            }
+            log::info!(
+                "Resume mode: applying {} existing merges to corpus ({} words) in parallel...",
+                start_merges_done, words.len()
+            );
+            let snapshot = self.merges.clone();
+            words.par_iter_mut().for_each(|word| {
+                apply_merges_to_word(word, &snapshot);
+            });
+            log::info!("Done applying existing merges. Resuming from merge #{}.", start_merges_done);
+        }
+
+        let num_merges = total_merges_needed - start_merges_done;
+        log::info!(
+            "Starting BPE training: {} merges to compute (base offset: {})",
+            num_merges, start_merges_done
+        );
 
         // ---- Initial pair_counts and where_to_update (parallel) ----
         log::info!(
@@ -265,8 +314,8 @@ impl Tokenizer {
                 continue;
             }
 
-            // Record merge
-            let new_id = 256 + merges_done;
+            // Record merge — offset by any pre-existing merges when resuming
+            let new_id = 256 + start_merges_done + merges_done;
             self.merges.insert(top.pair, new_id);
 
             // Merge this pair in all words where it occurs
@@ -316,7 +365,11 @@ impl Tokenizer {
             }
         }
 
-        log::info!("Finished training: {} merges completed", merges_done);
+        log::info!(
+            "Finished training: {} new merges completed (total merges: {})",
+            merges_done,
+            start_merges_done + merges_done
+        );
     }
 }
 
@@ -475,6 +528,17 @@ impl Tokenizer {
 
         self.train_core_incremental(words, cvec, vocab_size, min_frequency);
         Ok(())
+    }
+
+    /// Load existing merges into the tokenizer (for resuming training or loading checkpoints).
+    /// Merges must be provided as (left_id, right_id, merged_id) tuples, as returned by
+    /// `get_merges()`. After calling this, `train_from_iterator()` will detect the pre-loaded
+    /// merges and resume training from them rather than starting from scratch.
+    pub fn load_merges(&mut self, merges: Vec<(u32, u32, u32)>) {
+        self.merges.clear();
+        for (left_id, right_id, merged_id) in merges {
+            self.merges.insert((left_id, right_id), merged_id);
+        }
     }
 
     /// Return the regex pattern
@@ -1256,5 +1320,175 @@ mod tests {
 
         let (pair_counts, _positions) = count_pairs_parallel(&words, &counts);
         assert!(pair_counts.is_empty());
+    }
+
+    // ==================== Resume training tests ====================
+
+    #[test]
+    fn test_apply_merges_to_word_basic() {
+        let mut merges = StdHashMap::new();
+        merges.insert((97, 98), 256u32); // 'a','b' -> 256
+
+        // [97, 98, 99, 97, 98] with merge (97,98)->256 should become [256, 99, 256]
+        let mut word = Word::new(vec![97, 98, 99, 97, 98]);
+        apply_merges_to_word(&mut word, &merges);
+        assert_eq!(word.ids, vec![256, 99, 256]);
+    }
+
+    #[test]
+    fn test_apply_merges_to_word_chained() {
+        let mut merges = StdHashMap::new();
+        merges.insert((97, 97), 256u32); // 'aa' -> 256
+        merges.insert((256, 97), 257u32); // 'aaa' -> 257
+
+        // [97, 97, 97]: first merge (97,97)->256 => [256, 97], then (256,97)->257 => [257]
+        let mut word = Word::new(vec![97, 97, 97]);
+        apply_merges_to_word(&mut word, &merges);
+        assert_eq!(word.ids, vec![257]);
+    }
+
+    #[test]
+    fn test_apply_merges_to_word_no_match() {
+        let mut merges = StdHashMap::new();
+        merges.insert((1, 2), 256u32);
+
+        // Word has no matching pairs
+        let mut word = Word::new(vec![10, 20, 30]);
+        apply_merges_to_word(&mut word, &merges);
+        assert_eq!(word.ids, vec![10, 20, 30]); // unchanged
+    }
+
+    #[test]
+    fn test_apply_merges_to_word_empty() {
+        let merges = StdHashMap::new();
+        let mut word = Word::new(vec![]);
+        apply_merges_to_word(&mut word, &merges);
+        assert!(word.ids.is_empty());
+    }
+
+    #[test]
+    fn test_load_merges_and_get_merges_roundtrip() {
+        let mut tok = Tokenizer::new(false);
+        // Manually populate merges via train_core_incremental
+        let words = vec![Word::new(vec![97, 98, 97, 98])];
+        let counts = vec![10];
+        tok.train_core_incremental(words, counts, 258, 1);
+
+        // Round-trip: get_merges() -> load_merges() -> get_merges() must be equal
+        let original = tok.get_merges();
+        let mut tok2 = Tokenizer::new(false);
+        tok2.load_merges(original.clone());
+        let reloaded = tok2.get_merges();
+        assert_eq!(original, reloaded);
+    }
+
+    #[test]
+    fn test_resume_train_core_determinism() {
+        // Corpus: "aaabbb" with count 10
+        let make_words = || vec![Word::new(vec![97, 97, 97, 98, 98, 98])];
+        let counts = vec![10];
+
+        // --- Single run to vocab_size 260 (4 merges) ---
+        let mut tok_single = Tokenizer::new(false);
+        tok_single.train_core_incremental(make_words(), counts.clone(), 260, 1);
+        let single_merges = tok_single.get_merges();
+        assert_eq!(single_merges.len(), 4);
+
+        // --- Two-phase run: first 2 merges, then 2 more ---
+        let mut tok_phase1 = Tokenizer::new(false);
+        tok_phase1.train_core_incremental(make_words(), counts.clone(), 258, 1);
+        let phase1_merges = tok_phase1.get_merges();
+        assert_eq!(phase1_merges.len(), 2);
+
+        let mut tok_resume = Tokenizer::new(false);
+        tok_resume.load_merges(phase1_merges);
+        tok_resume.train_core_incremental(make_words(), counts.clone(), 260, 1);
+        let resumed_merges = tok_resume.get_merges();
+        assert_eq!(resumed_merges.len(), 4);
+
+        // All 4 merges must be identical between single-run and resumed
+        assert_eq!(single_merges, resumed_merges,
+            "Resume training must produce identical merges as single-run training");
+    }
+
+    #[test]
+    fn test_resume_no_additional_training_needed() {
+        // If existing merges already meet the target, train_core_incremental should be a no-op
+        let words = vec![Word::new(vec![97, 98])];
+        let counts = vec![10];
+
+        let mut tok = Tokenizer::new(false);
+        tok.train_core_incremental(words.clone(), counts.clone(), 257, 1); // 1 merge
+        let merges_before = tok.get_merges();
+        assert_eq!(merges_before.len(), 1);
+
+        // Call again with the SAME vocab_size — should be a no-op (1 merge already satisfies 257)
+        tok.train_core_incremental(words.clone(), counts.clone(), 257, 1);
+        let merges_after = tok.get_merges();
+        assert_eq!(merges_before, merges_after,
+            "Re-training with same vocab_size should not change merges");
+    }
+
+    #[test]
+    fn test_resume_encoding_matches_single_run() {
+        // "hello" repeated many times
+        let make_words = || {
+            vec![
+                Word::new("hello ".bytes().map(|b| b as u32).collect()),
+                Word::new("world ".bytes().map(|b| b as u32).collect()),
+            ]
+        };
+        let counts = vec![20, 10];
+
+        // Single run to 260
+        let mut tok_single = Tokenizer {
+            merges: StdHashMap::new(),
+            pattern: r"\w+|\s+".to_string(),
+            compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
+            use_hf_byte_order: false,
+            special_tokens: Vec::new(),
+        };
+        tok_single.train_core_incremental(make_words(), counts.clone(), 260, 1);
+
+        // Phase 1 (258), then resume to 260
+        let mut tok_p1 = Tokenizer {
+            merges: StdHashMap::new(),
+            pattern: r"\w+|\s+".to_string(),
+            compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
+            use_hf_byte_order: false,
+            special_tokens: Vec::new(),
+        };
+        tok_p1.train_core_incremental(make_words(), counts.clone(), 258, 1);
+        let p1_merges = tok_p1.get_merges();
+
+        let mut tok_resumed = Tokenizer {
+            merges: StdHashMap::new(),
+            pattern: r"\w+|\s+".to_string(),
+            compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
+            use_hf_byte_order: false,
+            special_tokens: Vec::new(),
+        };
+        tok_resumed.load_merges(p1_merges);
+        tok_resumed.train_core_incremental(make_words(), counts.clone(), 260, 1);
+
+        // Encoding "hello world" must be identical
+        let ids_single = tok_single.encode("hello world");
+        let ids_resumed = tok_resumed.encode("hello world");
+        assert_eq!(ids_single, ids_resumed,
+            "Resume-trained tokenizer must encode identically to single-run tokenizer");
+    }
+
+    #[test]
+    fn test_load_merges_clears_previous() {
+        let mut tok = Tokenizer::new(false);
+        tok.merges.insert((1, 2), 256);
+        tok.merges.insert((3, 4), 257);
+        assert_eq!(tok.merges.len(), 2);
+
+        // load_merges replaces all existing merges
+        tok.load_merges(vec![(10, 20, 256)]);
+        assert_eq!(tok.merges.len(), 1);
+        assert!(tok.merges.contains_key(&(10, 20)));
+        assert!(!tok.merges.contains_key(&(1, 2)));
     }
 }
