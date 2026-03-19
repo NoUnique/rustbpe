@@ -66,6 +66,8 @@ pub struct Tokenizer {
     compiled_pattern: Regex,
     /// Use HF-compatible byte-to-ID mapping for tie-breaking equivalence
     use_hf_byte_order: bool,
+    /// Special tokens (strings only). IDs are dynamically computed as vocab_size + i.
+    pub special_tokens: Vec<String>,
 }
 
 impl Default for Tokenizer {
@@ -73,6 +75,7 @@ impl Default for Tokenizer {
         Self::new(false)
     }
 }
+
 
 // ------------------------ internal helpers ------------------------
 
@@ -329,14 +332,15 @@ impl Tokenizer {
             pattern: String::new(),
             compiled_pattern: Regex::new("").expect("Empty regex should be valid"),
             use_hf_byte_order,
+            special_tokens: Vec::new(),
         }
     }
 
     /// Train from a streaming iterator (parallel ingestion).
     /// We refill a Rust Vec<String> buffer under the GIL, then release the GIL
     /// to do the heavy splitting and counting **in parallel** with rayon.
-    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, min_frequency=2))]
-    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, min_frequency=2)")]
+    #[pyo3(signature = (iterator, vocab_size, buffer_size=8192, pattern=None, min_frequency=2, special_tokens=None))]
+    #[pyo3(text_signature = "(self, iterator, vocab_size, buffer_size=8192, pattern=None, min_frequency=2, special_tokens=None)")]
     pub fn train_from_iterator(
         &mut self,
         py: pyo3::Python<'_>,
@@ -345,7 +349,11 @@ impl Tokenizer {
         buffer_size: usize,
         pattern: Option<String>,
         min_frequency: i32,
+        special_tokens: Option<Vec<String>>,
     ) -> PyResult<()> {
+        // Store special tokens (strings only; IDs are computed dynamically as vocab_size + i)
+        self.special_tokens = special_tokens.unwrap_or_default();
+
         // Use provided pattern or default to GPT-4 pattern
         let pattern_str = pattern.unwrap_or_else(|| GPT4_PATTERN.to_string());
 
@@ -413,12 +421,18 @@ impl Tokenizer {
             total_sequences += buf.len() as u64;
 
             let pattern = self.compiled_pattern.clone();
+            // Build an owned set of special token strings so it can be moved into the closure
+            let special_set: AHashSet<String> = self.special_tokens.iter().cloned().collect();
             let local: AHashMap<CompactString, i32> = py.detach(|| {
                 buf.par_iter()
                     .map(|s| {
                         let mut m: AHashMap<CompactString, i32> = AHashMap::new();
                         for mat in pattern.find_iter(s) {
                             let piece = mat.expect("regex match failed").as_str();
+                            // Skip chunks that exactly match a special token
+                            if special_set.contains(piece) {
+                                continue;
+                            }
                             *m.entry(CompactString::from(piece)).or_default() += 1;
                         }
                         m
@@ -472,6 +486,68 @@ impl Tokenizer {
     #[getter]
     pub fn vocab_size(&self) -> u32 {
         256 + self.merges.len() as u32
+    }
+
+    /// Return special tokens as {token_string: token_id}.
+    /// IDs are dynamically assigned starting at vocab_size (256 + num_merges + i),
+    /// so they automatically shift after resume training without any ID collisions.
+    pub fn get_special_tokens(&self) -> StdHashMap<String, u32> {
+        let base = self.vocab_size();
+        self.special_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), base + i as u32))
+            .collect()
+    }
+
+    /// Encode text, treating registered special tokens as atomic units.
+    /// Special tokens are matched first (longest match wins at each position),
+    /// and the text between them is BPE-encoded with the regular `encode()`.
+    /// Use this instead of `encode()` when the text may contain special tokens.
+    pub fn encode_with_special_tokens(&self, text: &str) -> Vec<u32> {
+        if self.special_tokens.is_empty() {
+            return self.encode(text);
+        }
+
+        let base = self.vocab_size();
+        let sp_with_ids: Vec<(&str, u32)> = self.special_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), base + i as u32))
+            .collect();
+
+        let mut result = Vec::new();
+        let mut remaining = text;
+
+        'outer: while !remaining.is_empty() {
+            // Find the earliest special token occurrence; break ties by preferring longer match
+            let mut best: Option<(usize, usize, u32)> = None; // (start, end, id)
+            for &(tok_str, tok_id) in &sp_with_ids {
+                if let Some(pos) = remaining.find(tok_str) {
+                    let end = pos + tok_str.len();
+                    if best.is_none()
+                        || pos < best.unwrap().0
+                        || (pos == best.unwrap().0 && end > best.unwrap().1)
+                    {
+                        best = Some((pos, end, tok_id));
+                    }
+                }
+            }
+            match best {
+                None => {
+                    result.extend(self.encode(remaining));
+                    break 'outer;
+                }
+                Some((start, end, tok_id)) => {
+                    if start > 0 {
+                        result.extend(self.encode(&remaining[..start]));
+                    }
+                    result.push(tok_id);
+                    remaining = &remaining[end..];
+                }
+            }
+        }
+        result
     }
 
     /// Return the mergeable ranks (token bytes -> token id / rank)
@@ -612,9 +688,21 @@ impl Tokenizer {
             vocab[merged_id as usize] = merged_bytes;
         }
 
+        // Build reverse map for special tokens: id -> UTF-8 bytes
+        let base = self.vocab_size();
+        let special_id_to_bytes: StdHashMap<u32, Vec<u8>> = self.special_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (base + i as u32, s.as_bytes().to_vec()))
+            .collect();
+
         // Convert each token id to bytes and concatenate
         let mut bytes = Vec::new();
         for &id in &ids {
+            if let Some(sp_bytes) = special_id_to_bytes.get(&id) {
+                bytes.extend(sp_bytes);
+                continue;
+            }
             let token_bytes = vocab.get(id as usize).ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!("Unknown token id: {}", id))
             })?;
@@ -731,6 +819,7 @@ mod tests {
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
         let ids = tok.encode("hi");
         // 'h' = 104, 'i' = 105
@@ -748,6 +837,7 @@ mod tests {
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         let ids = tok.encode("hi");
@@ -781,6 +871,7 @@ mod tests {
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         let ranks = tok.get_mergeable_ranks();
@@ -819,6 +910,7 @@ mod tests {
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         // "ab" repeated 10 times, "cd" repeated 5 times
@@ -907,6 +999,7 @@ mod tests {
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         // "aaa" should encode as [257]
@@ -952,6 +1045,7 @@ mod tests {
             pattern: r"\w+|\s+".to_string(),
             compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         let text = "hi";
@@ -972,6 +1066,7 @@ mod tests {
             pattern: r"\w+|\s+".to_string(),
             compiled_pattern: Regex::new(r"\w+|\s+").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         let text = "hello world";
@@ -988,6 +1083,7 @@ mod tests {
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         // [104, 105] = "hi"
@@ -1011,6 +1107,7 @@ mod tests {
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         // "ab" appears 100 times, "bc" appears 50 times
@@ -1037,6 +1134,7 @@ mod tests {
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         // "aaa" = [97, 97, 97]
@@ -1064,6 +1162,7 @@ mod tests {
             pattern: String::new(),
             compiled_pattern: Regex::new("").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         let ranks = tok.get_mergeable_ranks();
@@ -1083,6 +1182,7 @@ mod tests {
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         let ids = tok.encode("");
@@ -1097,6 +1197,7 @@ mod tests {
             pattern: r"\w+".to_string(),
             compiled_pattern: Regex::new(r"\w+").unwrap(),
             use_hf_byte_order: false,
+            special_tokens: Vec::new(),
         };
 
         let ids = tok.encode("   "); // only spaces

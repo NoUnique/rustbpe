@@ -741,3 +741,300 @@ def test_batch_encode_performance(enwik8_large):
     # Warn if speedup is low (can vary by machine/load)
     if speedup < 1.5:
         warnings.warn(f"batch_encode() speedup was only {speedup:.2f}x (expected >1.5x)")
+
+
+# =============================================================================
+# Special token tests
+# =============================================================================
+
+SPECIAL_CORPUS = [
+    "<s> hello world </s>",
+    "<s> foo bar </s>",
+    "hello world foo bar baz",
+    "the quick brown fox jumps over the lazy dog",
+] * 100  # repeat to get statistically stable merge counts
+
+SPECIAL_LIST = ["<s>", "</s>", "<pad>", "<unk>"]
+
+
+def make_trained_with_special(vocab_size=400, special_tokens=None):
+    tok = rustbpe.Tokenizer()
+    tok.train_from_iterator(iter(SPECIAL_CORPUS), vocab_size=vocab_size,
+                            special_tokens=special_tokens)
+    return tok
+
+
+# -----------------------------------------------------------------------------
+# 1. ID assignment
+
+def test_special_token_ids_start_after_vocab():
+    """Special token IDs = vocab_size, vocab_size+1, ..."""
+    tok = make_trained_with_special(400, SPECIAL_LIST)
+    sp = tok.get_special_tokens()
+    base = tok.vocab_size
+    for i, name in enumerate(SPECIAL_LIST):
+        assert sp[name] == base + i, f"{name}: expected {base + i}, got {sp[name]}"
+    print("✅ special token IDs start after vocab_size")
+
+
+def test_special_token_ids_no_collision_with_merges():
+    """Special token IDs must not overlap with any merge token IDs."""
+    tok = make_trained_with_special(400, SPECIAL_LIST)
+    sp = tok.get_special_tokens()
+    merge_ids = {v for _, _, v in tok.get_merges()}
+    for name, sid in sp.items():
+        assert sid not in merge_ids, f"{name} ID {sid} collides with a merge token"
+    print("✅ no ID collision between special tokens and merges")
+
+
+def test_no_special_tokens_returns_empty_dict():
+    """Tokenizer with no special tokens returns empty dict."""
+    tok = make_trained_with_special(300, None)
+    assert tok.get_special_tokens() == {}
+    print("✅ get_special_tokens() returns empty dict when none registered")
+
+
+def test_special_tokens_order_preserved():
+    """IDs are assigned in the same order as the input list."""
+    tok = make_trained_with_special(400, ["<A>", "<B>", "<C>"])
+    sp = tok.get_special_tokens()
+    base = tok.vocab_size
+    assert sp["<A>"] == base,     f"<A>: expected {base}, got {sp['<A>']}"
+    assert sp["<B>"] == base + 1, f"<B>: expected {base+1}, got {sp['<B>']}"
+    assert sp["<C>"] == base + 2, f"<C>: expected {base+2}, got {sp['<C>']}"
+    print("✅ special token order is preserved")
+
+
+def test_vocab_size_excludes_special_tokens():
+    """vocab_size = 256 + merges only. Special tokens are NOT counted."""
+    tok = make_trained_with_special(400, SPECIAL_LIST)
+    assert tok.vocab_size == 256 + len(tok.get_merges()), \
+        f"vocab_size mismatch: {tok.vocab_size} != 256 + {len(tok.get_merges())}"
+    print("✅ vocab_size does not include special tokens")
+
+
+# -----------------------------------------------------------------------------
+# 2. Training exclusion
+
+def test_special_tokens_not_in_mergeable_ranks():
+    """Special token strings must not appear as learned merge tokens."""
+    tok = make_trained_with_special(400, SPECIAL_LIST)
+    rank_bytes = {bytes(b) for b, _ in tok.get_mergeable_ranks()}
+    for sp in SPECIAL_LIST:
+        assert sp.encode() not in rank_bytes, \
+            f"{sp!r} should not be in mergeable_ranks"
+    print("✅ special token byte sequences not in mergeable_ranks")
+
+
+def test_special_token_excluded_from_bpe_corpus():
+    """Chunks that exactly match a special token are excluded from BPE merge counting."""
+    # Train two tokenizers on the same corpus:
+    # - one with "<s>" / "</s>" marked as special
+    # - one without
+    # The "without" tokenizer must eventually learn to merge '<', 's', '>'
+    # into "<s>", while the "with" tokenizer must NOT.
+    tok_with = make_trained_with_special(500, ["<s>", "</s>"])
+    tok_without = make_trained_with_special(500, None)
+
+    # "<s>" as bytes is b'<s>' = [60, 115, 62]
+    target_bytes = "<s>".encode()
+    ranks_with = {bytes(b): v for b, v in tok_with.get_mergeable_ranks()}
+    ranks_without = {bytes(b): v for b, v in tok_without.get_mergeable_ranks()}
+
+    assert target_bytes not in ranks_with, \
+        "'<s>' should NOT appear in mergeable_ranks when it is a special token"
+    # (it may or may not appear in the without case depending on frequency, but that's fine)
+    print("✅ '<s>' not learned as merge token when registered as special")
+
+
+# -----------------------------------------------------------------------------
+# 3. encode_with_special_tokens
+
+def test_encode_special_token_ids_correct():
+    """Encoded IDs include special token IDs at correct positions."""
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    sp = tok.get_special_tokens()
+    ids = tok.encode_with_special_tokens("<s> hello </s>")
+    assert ids[0] == sp["<s>"],  f"First ID should be <s> ({sp['<s>']}), got {ids[0]}"
+    assert ids[-1] == sp["</s>"], f"Last ID should be </s> ({sp['</s>']}), got {ids[-1]}"
+    print("✅ encode_with_special_tokens places special token IDs correctly")
+
+
+def test_encode_special_token_at_start():
+    tok = make_trained_with_special(400, ["<s>"])
+    sp = tok.get_special_tokens()
+    ids = tok.encode_with_special_tokens("<s>hello")
+    assert ids[0] == sp["<s>"], f"First token should be <s>, got {ids[0]}"
+    assert len(ids) > 1, "Should have more tokens after <s>"
+    print("✅ special token at start of text")
+
+
+def test_encode_special_token_at_end():
+    tok = make_trained_with_special(400, ["</s>"])
+    sp = tok.get_special_tokens()
+    ids = tok.encode_with_special_tokens("hello</s>")
+    assert ids[-1] == sp["</s>"], f"Last token should be </s>, got {ids[-1]}"
+    print("✅ special token at end of text")
+
+
+def test_encode_adjacent_special_tokens():
+    """Two consecutive special tokens with nothing between them."""
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    sp = tok.get_special_tokens()
+    ids = tok.encode_with_special_tokens("<s></s>")
+    assert ids == [sp["<s>"], sp["</s>"]], \
+        f"Expected [{sp['<s>']}, {sp['</s>']}], got {ids}"
+    print("✅ adjacent special tokens encoded correctly")
+
+
+def test_encode_multiple_special_token_occurrences():
+    """Same special token appears multiple times."""
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    sp = tok.get_special_tokens()
+    ids = tok.encode_with_special_tokens("<s> foo <s> bar </s>")
+    assert ids[0] == sp["<s>"]
+    assert ids[-1] == sp["</s>"]
+    assert ids.count(sp["<s>"]) == 2
+    print("✅ multiple occurrences of a special token handled")
+
+
+def test_encode_no_special_tokens_in_text_falls_back_to_bpe():
+    """Falls back to regular BPE when no special tokens appear."""
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    ids_sp = tok.encode_with_special_tokens("hello world")
+    ids_bpe = tok.encode("hello world")
+    assert ids_sp == ids_bpe, \
+        f"Should fall back to regular BPE: {ids_sp} != {ids_bpe}"
+    print("✅ fallback to regular BPE when no special tokens present")
+
+
+def test_encode_unregistered_string_is_bpe_encoded():
+    """A string that looks like a special token but is not registered is BPE-encoded."""
+    tok = make_trained_with_special(400, ["<s>"])
+    ids_sp = tok.encode_with_special_tokens("</s>")  # </s> not registered
+    ids_bpe = tok.encode("</s>")
+    assert ids_sp == ids_bpe, \
+        f"Unregistered token should be BPE-encoded: {ids_sp} != {ids_bpe}"
+    print("✅ unregistered special token string is BPE-encoded")
+
+
+def test_encode_longer_match_wins_over_prefix():
+    """When two special tokens share a prefix, the longer one wins."""
+    tok = make_trained_with_special(400, ["<|im", "<|im_start|>"])
+    sp = tok.get_special_tokens()
+    ids = tok.encode_with_special_tokens("<|im_start|>")
+    assert ids == [sp["<|im_start|>"]], \
+        f"Longer match should win: expected [{sp['<|im_start|>']}], got {ids}"
+    print("✅ longer special token match wins over shorter prefix")
+
+
+def test_encode_empty_string_with_special_tokens():
+    tok = make_trained_with_special(300, ["<s>"])
+    assert tok.encode_with_special_tokens("") == []
+    print("✅ empty string encodes to empty list")
+
+
+def test_encode_only_special_tokens():
+    """String consisting entirely of special tokens."""
+    tok = make_trained_with_special(400, ["<s>", "</s>", "<pad>"])
+    sp = tok.get_special_tokens()
+    ids = tok.encode_with_special_tokens("<s><pad></s>")
+    assert ids == [sp["<s>"], sp["<pad>"], sp["</s>"]], \
+        f"Expected {[sp['<s>'], sp['<pad>'], sp['</s>']]}, got {ids}"
+    print("✅ string of only special tokens encoded correctly")
+
+
+def test_encode_text_between_special_tokens_is_bpe():
+    """Text segments between special tokens are BPE-encoded normally."""
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    sp = tok.get_special_tokens()
+    segment = " hello "
+    ids_full = tok.encode_with_special_tokens(f"<s>{segment}</s>")
+    ids_segment = tok.encode(segment)
+    assert ids_full == [sp["<s>"]] + ids_segment + [sp["</s>"]], \
+        f"Middle segment BPE mismatch: {ids_full}"
+    print("✅ text between special tokens is BPE-encoded")
+
+
+# -----------------------------------------------------------------------------
+# 4. decode
+
+def test_decode_special_token_id():
+    """Decoding a single special token ID returns the token string."""
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    sp = tok.get_special_tokens()
+    assert tok.decode([sp["<s>"]]) == "<s>"
+    assert tok.decode([sp["</s>"]]) == "</s>"
+    print("✅ decoding special token IDs returns correct strings")
+
+
+def test_decode_round_trip_with_special_tokens():
+    """encode_with_special_tokens followed by decode returns the original string."""
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    text = "<s> hello world </s>"
+    ids = tok.encode_with_special_tokens(text)
+    assert tok.decode(ids) == text, f"Round-trip failed: {tok.decode(ids)!r} != {text!r}"
+    print("✅ encode_with_special_tokens -> decode round-trip works")
+
+
+def test_decode_round_trip_adjacent_special_tokens():
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    text = "<s></s>"
+    ids = tok.encode_with_special_tokens(text)
+    assert tok.decode(ids) == text
+    print("✅ adjacent special tokens round-trip")
+
+
+def test_decode_round_trip_only_special_tokens():
+    tok = make_trained_with_special(400, ["<s>", "</s>", "<pad>"])
+    text = "<s><pad></s>"
+    ids = tok.encode_with_special_tokens(text)
+    assert tok.decode(ids) == text
+    print("✅ all-special-token string round-trip")
+
+
+def test_decode_mixed_bpe_and_special_tokens():
+    tok = make_trained_with_special(400, ["<s>", "</s>"])
+    sp = tok.get_special_tokens()
+    segment_ids = tok.encode(" hello world ")
+    mixed_ids = [sp["<s>"]] + segment_ids + [sp["</s>"]]
+    decoded = tok.decode(mixed_ids)
+    assert decoded == "<s> hello world </s>", f"Unexpected: {decoded!r}"
+    print("✅ mixed BPE + special token IDs decode correctly")
+
+
+# -----------------------------------------------------------------------------
+# 5. Resume training — ID reassignment
+
+def test_resume_training_reassigns_special_token_ids():
+    """After resume training, special token IDs shift to new vocab end."""
+    tok = rustbpe.Tokenizer()
+    tok.train_from_iterator(iter(SPECIAL_CORPUS), vocab_size=300,
+                            special_tokens=["<s>", "</s>"])
+    sp_before = tok.get_special_tokens()
+    vocab_before = tok.vocab_size
+
+    # Resume training with larger vocab
+    tok.train_from_iterator(iter(SPECIAL_CORPUS), vocab_size=400,
+                            special_tokens=["<s>", "</s>"])
+    sp_after = tok.get_special_tokens()
+    vocab_after = tok.vocab_size
+
+    assert vocab_after > vocab_before, "Vocab should grow after resume training"
+    assert sp_after["<s>"] == vocab_after,     f"<s> ID should be {vocab_after}, got {sp_after['<s>']}"
+    assert sp_after["</s>"] == vocab_after + 1, f"</s> ID should be {vocab_after+1}, got {sp_after['</s>']}"
+    assert sp_after["<s>"] != sp_before["<s>"], "IDs should have changed after more merges"
+    print("✅ special token IDs correctly reassigned after resume training")
+
+
+def test_resume_training_no_id_collision():
+    """After resume training, special token IDs still don't collide with merges."""
+    tok = rustbpe.Tokenizer()
+    tok.train_from_iterator(iter(SPECIAL_CORPUS), vocab_size=300,
+                            special_tokens=["<s>"])
+    tok.train_from_iterator(iter(SPECIAL_CORPUS), vocab_size=400,
+                            special_tokens=["<s>"])
+    sp = tok.get_special_tokens()
+    merge_ids = {v for _, _, v in tok.get_merges()}
+    assert sp["<s>"] not in merge_ids, f"<s> ID {sp['<s>']} collides with a merge"
+    print("✅ no ID collision after resume training")

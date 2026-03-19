@@ -14,6 +14,7 @@ A lightweight Rust library for training GPT-style BPE tokenizers. The [tiktoken]
 
 - Fast training with parallel processing (rayon)
 - GPT-4 style regex pre-tokenization by default
+- Special token support: exclude from BPE training, atomic encoding, tiktoken-compatible IDs
 - Direct export to tiktoken format
 - Python bindings via PyO3
 - Batch encoding with automatic parallelization
@@ -86,6 +87,58 @@ ids = enc.encode("hello world")
 text = enc.decode(ids)
 ```
 
+### Special tokens
+
+Special tokens are atomic strings that bypass BPE merging entirely. Register them at training time via the `special_tokens` parameter:
+
+```python
+tokenizer = rustbpe.Tokenizer()
+tokenizer.train_from_iterator(
+    texts,
+    vocab_size=4096,
+    special_tokens=["<s>", "</s>", "<pad>", "<unk>"]
+)
+```
+
+Two things happen when special tokens are registered:
+
+1. **Excluded from BPE training** — any pre-tokenized chunk that exactly matches a special token string is skipped from merge counting.
+2. **IDs assigned after the BPE vocabulary** — special token IDs start at `vocab_size` and increment in list order. They are computed dynamically, so they are always collision-free with merge token IDs.
+
+```python
+tokenizer.get_special_tokens()
+# {"<s>": 4096, "</s>": 4097, "<pad>": 4098, "<unk>": 4099}
+
+print(tokenizer.vocab_size)  # 4096 (256 bytes + merges only, special tokens not counted)
+```
+
+To encode text that may contain special tokens, use `encode_with_special_tokens()` instead of `encode()`. It matches special tokens first (longest match wins), then BPE-encodes the segments between them:
+
+```python
+ids = tokenizer.encode_with_special_tokens("<s> hello world </s>")
+# [4096, ..., 4097]  — <s> and </s> are atomic; middle text is BPE-encoded
+
+text = tokenizer.decode(ids)  # "<s> hello world </s>"
+```
+
+To export to tiktoken with special tokens:
+
+```python
+enc = tiktoken.Encoding(
+    name="my_tokenizer",
+    pat_str=tokenizer.get_pattern(),
+    mergeable_ranks={bytes(k): v for k, v in tokenizer.get_mergeable_ranks()},
+    special_tokens=tokenizer.get_special_tokens(),  # pass the dict directly
+)
+```
+
+**Behavior notes:**
+
+- `vocab_size` counts only byte tokens + merges. Special tokens are not included.
+- `get_mergeable_ranks()` does not include special tokens (tiktoken convention).
+- Special tokens must be re-specified on every `train_from_iterator` call. If omitted, the list is cleared.
+- After resume training with a larger `vocab_size`, special token IDs shift to the new end of vocabulary. Always call `get_special_tokens()` after training to get the current IDs.
+
 ### Custom regex pattern
 
 By default, rustbpe uses the GPT-4 tokenization pattern. You can provide your own:
@@ -105,13 +158,16 @@ tokenizer.train_from_iterator(
 | Method | Description |
 |--------|-------------|
 | `Tokenizer()` | Create a new tokenizer |
-| `train_from_iterator(texts, vocab_size, buffer_size=8192, pattern=None)` | Train on an iterator of strings |
-| `encode(text)` | Encode a string to token IDs |
-| `decode(ids)` | Decode token IDs back to a string |
+| `train_from_iterator(texts, vocab_size, buffer_size=8192, pattern=None, min_frequency=2, special_tokens=None)` | Train on an iterator of strings |
+| `encode(text)` | Encode a string to token IDs (ignores special tokens) |
+| `encode_with_special_tokens(text)` | Encode a string, treating registered special tokens as atomic units |
+| `decode(ids)` | Decode token IDs back to a string (handles special token IDs) |
 | `batch_encode(texts)` | Encode multiple strings in parallel |
-| `vocab_size` | Property: vocabulary size (256 + number of merges) |
+| `vocab_size` | Property: vocabulary size (256 + number of merges, excludes special tokens) |
 | `get_pattern()` | Get the regex pattern used for pre-tokenization |
-| `get_mergeable_ranks()` | Get token bytes and ranks for tiktoken export |
+| `get_mergeable_ranks()` | Get token bytes and ranks for tiktoken export (excludes special tokens) |
+| `get_special_tokens()` | Get `{token_string: token_id}` dict for all registered special tokens |
+| `get_merges()` | Get all merge rules as `(left_id, right_id, merged_id)` triples |
 
 ## Development
 
